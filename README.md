@@ -1,0 +1,1 @@
+# SummitAI – AI that helps you “summit” your meetings with clarity.
