@@ -1,18 +1,30 @@
 import json
 import uuid
+from dotenv import load_dotenv
+from elevenlabs import ElevenLabs
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from typing import Dict
 import os
 import uuid
-import shutil
-import asyncio
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 import aiofiles
-import requests
+from io import BytesIO
+from elevenlabs.client import ElevenLabs
+from google import genai
+
+load_dotenv()   
+
+ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+elevenlabs = ElevenLabs(
+    api_key=ELEVEN_API_KEY,
+)
 
 app = FastAPI()
 
@@ -100,7 +112,6 @@ STORAGE_DIR.mkdir(exist_ok=True)
 # Simple in-memory meeting index (use DB for production)
 meetings = {}  # meeting_id -> { "chunks": [paths], "chats":[{...}], "participants":[], ... }
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 class ChatMessage(BaseModel):
     meeting_id: str
@@ -154,56 +165,41 @@ async def finalize_meeting(meeting_id: str, title: Optional[str] = None):
             with open(p, "rb") as infile:
                 outfile.write(infile.read())
 
-    transcript_text = await transcribe_with_openai(concatenated)
+    transcript_text = await transcribe_with_elevenlabs(concatenated)
 
     prompt = build_summary_prompt(title or f"Meeting {meeting_id}", transcript_text, chats)
 
-    summary = await summarize_with_openai(prompt)
+    summary = await summarize_with_gemini(prompt)
 
     meetings[meeting_id]["transcript"] = transcript_text
     meetings[meeting_id]["summary"] = summary
 
     return {"status": "ok", "summary": summary, "transcript": transcript_text}
 
-async def transcribe_with_openai(audio_path: Path) -> str:
+async def transcribe_with_elevenlabs(audio_path: Path) -> str:
     """
-    Upload audio file to OpenAI's transcription endpoint.
-    This is a simplified example using requests; you can use official SDK.
+    Use ElevenLabs Speech-to-Text for transcription.
     """
-    url = "https://api.openai.com/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    with open(audio_path, "rb") as f:
-        files = {"file": (audio_path.name, f, "audio/webm")}
-        data = {"model": "whisper-1", "language": "en"}
-        resp = requests.post(url, headers=headers, files=files, data=data)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"transcription failed: {resp.text}")
-    result = resp.json()
-    # Common response: {"text": "transcribed text ..."}
-    return result.get("text", "")
 
-async def summarize_with_openai(prompt: str) -> str:
+    with open(audio_path, "rb") as f:
+        audio_data = BytesIO(f.read())
+        transcription = elevenlabs.speech_to_text.convert(
+            file=audio_data,
+            model_id="scribe_v1", 
+            tag_audio_events=True, 
+            language_code="eng",
+            diarize=True,
+        )
+
+    return transcription
+
+async def summarize_with_gemini(prompt: str) -> str:
     """
-    Call the LLM (chat completion) to produce meeting minutes.
-    Adjust to the model you have access to.
+    Summarize using Google Gemini.
     """
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "gpt-4o-mini", 
-        "messages": [
-            {"role": "system", "content": "You are an assistant that converts raw meeting transcripts and chat logs into clear meeting minutes with action items."},
-            {"role": "user", "content": prompt}
-        ],
-        "max_tokens": 1000,
-        "temperature": 0.1
-    }
-    resp = requests.post(url, headers=headers, json=payload)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"summary failed: {resp.text}")
-    data = resp.json()
-    # extract first assistant message
-    return data["choices"][0]["message"]["content"].strip()
+    response = ai_client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+    return response.candidates[0].content.parts[0].text.strip()
+
 
 def build_summary_prompt(title: str, transcript: str, chats: List[dict]) -> str:
     chat_text = "\n".join([f"[{c['ts']}] {c['sender']}: {c['text']}" for c in chats])
