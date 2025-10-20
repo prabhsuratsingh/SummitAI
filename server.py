@@ -13,6 +13,7 @@ import aiofiles
 from io import BytesIO
 from elevenlabs.client import ElevenLabs
 from google import genai
+import socketio
 
 load_dotenv()   
 
@@ -25,10 +26,53 @@ elevenlabs = ElevenLabs(
 )
 
 app = FastAPI()
+sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 
+socket_app = socketio.ASGIApp(sio)
+
+app.mount("/socket.io", socket_app)
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+# rooms: Dict[str, Dict[str, WebSocket]] = {}
+rooms = {}
 
-rooms: Dict[str, Dict[str, WebSocket]] = {}
+@sio.event
+async def connect(sid, environ):
+    print(f"Client connected: {sid}")
+
+@sio.event
+async def join(sid, data):
+    room = data["room"]
+    if room not in rooms:
+        rooms[room] = set()
+    for peer_sid in rooms[room]:
+        await sio.emit("new-peer", {"peer": sid}, to=peer_sid)
+        await sio.emit("existing-peer", {"peer": peer_sid}, to=sid)
+    rooms[room].add(sid)
+    print(f"{sid} joined {room}")
+
+@sio.event
+async def signal(sid, data):
+    """Forward SDP or ICE messages."""
+    target = data["target"]
+    await sio.emit("signal", {"from": sid, "data": data["data"]}, to=target)
+
+@sio.event
+async def chat(sid, data):
+    """Forward chat message to everyone in the room."""
+    room = data["room"]
+    msg = data["message"]
+    for peer in rooms.get(room, []):
+        await sio.emit("chat", {"from": sid, "message": msg}, to=peer)
+
+@sio.event
+async def disconnect(sid):
+    for room, members in rooms.items():
+        if sid in members:
+            members.remove(sid)
+            for peer_sid in members:
+                await sio.emit("peer-left", {"peer": sid}, to=peer_sid)
+            break
+    print(f"Client disconnected: {sid}")
 
 @app.websocket("/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):

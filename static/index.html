@@ -251,7 +251,8 @@
 
   <div id="summary"></div>
 
-  <script>
+  <script type="module">
+    import { io } from "https://cdn.socket.io/4.7.1/socket.io.esm.min.js";
     const BASE_URL = location.origin;
     const roomInput = document.getElementById("room");
     const joinBtn = document.getElementById("join");
@@ -266,76 +267,113 @@
     const muteBtn = document.getElementById("mute");
     const videoBtn = document.getElementById("video");
 
+    const peers = {}; // { peerId: RTCPeerConnection }
+    const localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+
+
     let ws, pc, clientId;
-    let localStream;
     let currentRoomId = null;
     let isMuted = false;
     let isVideoOff = false;
 
-    function addChatMessage(text, who = "peer") {
-      const msg = document.createElement("div");
-      msg.textContent = (who === "me" ? "You: " : "Peer: ") + text;
-      msg.style.marginBottom = "4px";
-      chatBox.appendChild(msg);
-      chatBox.scrollTop = chatBox.scrollHeight;
-    }
-
-    async function createPeerConnection() {
-      pc = new RTCPeerConnection();
-      pc.onicecandidate = (e) => {
-        if (e.candidate) {
-          ws.send(JSON.stringify({ type: "ice", candidate: e.candidate, from: clientId }));
-        }
-      };
-      pc.ontrack = (e) => {
-        remoteVideo.srcObject = e.streams[0];
-      };
-      localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
-    }
+    const socket = io();
 
     joinBtn.onclick = async () => {
-      const roomId = roomInput.value.trim();
-      if (!roomId) return alert("Enter room ID");
-      currentRoomId = roomId;
+      const room = roomInput.value.trim();
+      if (!room) return alert("Enter room ID");
+
+      currentRoomId = room;
+
       joinBtn.disabled = true;
       leaveBtn.disabled = false;
       finalizeBtn.disabled = false;
       muteBtn.disabled = false;
       videoBtn.disabled = false;
 
-      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       localVideo.srcObject = localStream;
+      socket.emit("join", { room });
+    };
 
-      startRecording(roomId);
 
-      ws = new WebSocket(`ws://${location.host}/ws/${roomId}`);
+    socket.on("new-peer", async ({ peer }) => {
+      const pc = createPeerConnection(peer);
+      peers[peer] = pc;
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
-      ws.onmessage = async (event) => {
-        const data = JSON.parse(event.data);
-        if (data.type === "joined") {
-          clientId = data.client_id;
-          await createPeerConnection();
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit("signal", { target: peer, data: { type: "offer", sdp: offer.sdp } });
+    });
 
-          if (data.peers.length > 0) {
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            ws.send(JSON.stringify({ type: "offer", offer, from: clientId }));
-          }
-        } else if (data.type === "offer") {
-          await createPeerConnection();
-          await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          ws.send(JSON.stringify({ type: "answer", answer, from: clientId }));
-        } else if (data.type === "answer") {
-          await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-        } else if (data.type === "ice") {
-          if (data.candidate) await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-        } else if (data.type === "chat") {
-          addChatMessage(data.text, "peer");
+    socket.on("existing-peer", async ({ peer }) => {
+      const pc = createPeerConnection(peer);
+      peers[peer] = pc;
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+    });
+
+    socket.on("signal", async ({ from, data }) => {
+      let pc = peers[from];
+      if (!pc) pc = createPeerConnection(from);
+
+      if (data.type === "offer") {
+        await pc.setRemoteDescription({ type: "offer", sdp: data.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit("signal", { target: from, data: { type: "answer", sdp: answer.sdp } });
+      } else if (data.type === "answer") {
+        await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+      } else if (data.candidate) {
+        try { await pc.addIceCandidate(data.candidate); } catch (e) { console.error(e); }
+      }
+    });
+
+
+    function createPeerConnection(peerId) {
+      const pc = new RTCPeerConnection();
+
+      pc.onicecandidate = event => {
+        if (event.candidate) {
+          socket.emit("signal", { target: peerId, data: { candidate: event.candidate } });
         }
       };
-    };
+
+      pc.ontrack = event => {
+        addRemoteVideo(peerId, event.streams[0]);
+      };
+
+      return pc;
+    }
+
+    function addRemoteVideo(peerId, stream) {
+      // if (peerId === myPeerId) return;
+      let video = document.getElementById(`video-${peerId}`);
+      if (!video) {
+        video = document.createElement("video");
+        video.id = `video-${peerId}`;
+        video.autoplay = true;
+        video.playsInline = true;
+        document.getElementById("videos").appendChild(video);
+      }
+      video.srcObject = stream;
+    }
+
+    socket.on("peer-left", ({ peer }) => {
+      const video = document.getElementById(`video-${peer}`);
+      if (video) video.remove();
+      if (peers[peer]) {
+        peers[peer].close();
+        delete peers[peer];
+      }
+    });
+
+
+    function addChatMessage(from, msg) {
+      const msgElement = document.createElement("div");
+      msgElement.textContent = from + ": " + msg;
+      msgElement.style.marginBottom = "4px";
+      chatBox.appendChild(msgElement);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
 
     let mediaRecorder;
 
@@ -392,7 +430,6 @@
       const ts = Date.now() / 1000;
       const msg = { meeting_id: currentRoomId, sender: clientId, text, ts };
       try {
-        ws.send(JSON.stringify({ type: "chat", text, from: clientId }));
         await fetch(`${BASE_URL}/ai/log_chat/`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -404,12 +441,17 @@
     }
 
     sendBtn.onclick = () => {
-      const text = chatInput.value.trim();
-      if (!text) return;
-      sendChat(text);
-      addChatMessage(text, "me");
-      chatInput.value = "";
+      const msg = chatInput.value.trim();
+      if (msg && room) {
+        sendChat(msg);
+        socket.emit("chat", { room: currentRoomId, message: msg });
+        chatInput.value = "";
+      }
     };
+
+    socket.on("chat", ({ from, message }) => {
+      addChatMessage(from.substring(0, 5), message);
+    });
 
     finalizeBtn.onclick = async () => {
       finalizeBtn.disabled = true;
