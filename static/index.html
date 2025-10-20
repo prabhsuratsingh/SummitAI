@@ -1,436 +1,4 @@
-<!-- <!doctype html>
-<html>
-
-<head>
-    <meta charset="utf-8" />
-    <title>1:1 WebRTC Demo with Chat + Mute</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 900px;
-            margin: 20px auto;
-        }
-
-        video {
-            width: 45%;
-            margin: 2%;
-            background: #000;
-        }
-
-        #controls {
-            margin-bottom: 12px;
-        }
-
-        input,
-        button {
-            padding: 6px;
-            margin: 2px;
-        }
-
-        #chat {
-            border: 1px solid #ccc;
-            padding: 10px;
-            max-height: 200px;
-            overflow-y: auto;
-        }
-
-        #chat input {
-            width: 70%;
-        }
-
-        #localScreen {
-            position: absolute;
-            bottom: 10px;
-            right: 10px;
-            width: 200px;
-            border: 2px solid white;
-            border-radius: 8px;
-            box-shadow: 0 0 10px rgba(0, 0, 0, 0.5);
-        }
-    </style>
-</head>
-
-<body>
-    <h1>1:1 WebRTC Demo</h1>
-
-    <div id="controls">
-        Room ID: <input id="roomId" value="testroom" />
-        <button id="joinBtn">Join Room</button>
-        <button id="callBtn" disabled>Call / Start</button>
-        <button id="hangupBtn" disabled>Hangup</button>
-        <button id="muteBtn" disabled>Mute</button>
-        <button id="videoBtn" disabled>Stop Video</button>
-        <button id="shareBtn" disabled>Share Screen</button>
-        <span id="status"></span>
-    </div>
-
-    <div id="videos">
-        <div>
-            <h3>You</h3>
-            <video id="localVideo" autoplay playsinline muted></video>
-            <video id="localScreen" autoplay playsinline muted hidden></video>
-        </div>
-        <div>
-            <h3>Remote</h3>
-            <video id="remoteVideo" autoplay playsinline></video>
-            <video id="remoteScreen" autoplay playsinline hidden></video>
-        </div>
-    </div>
-
-
-    <h2>Chat</h2>
-    <div id="chat"></div>
-    <input id="chatInput" placeholder="Type message..." />
-    <button id="sendBtn" disabled>Send</button>
-
-    <script>
-        (async () => {
-            const joinBtn = document.getElementById('joinBtn');
-            const callBtn = document.getElementById('callBtn');
-            const hangupBtn = document.getElementById('hangupBtn');
-            const muteBtn = document.getElementById('muteBtn');
-            const videoBtn = document.getElementById('videoBtn');
-            const sendBtn = document.getElementById('sendBtn');
-            const chatDiv = document.getElementById('chat');
-            const chatInput = document.getElementById('chatInput');
-            const roomInput = document.getElementById('roomId');
-            const status = document.getElementById('status');
-            const shareBtn = document.getElementById('shareBtn');
-            const localScreen = document.getElementById('localScreen');
-            const remoteScreen = document.getElementById('remoteScreen');
-            let screenStream = null;
-
-
-
-            let localStream = null;
-            let pc = null;
-            let ws = null;
-            let clientId = null;
-            let peers = [];
-            let muted = false;
-            let videoOff = false;
-
-            // STUN servers
-            const iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
-
-            function log(s) {
-                console.log(s);
-                status.textContent = s;
-            }
-
-            function addChatMessage(text, sender = "system") {
-                const p = document.createElement('p');
-                p.textContent = `${sender}: ${text}`;
-                chatDiv.appendChild(p);
-                chatDiv.scrollTop = chatDiv.scrollHeight;
-            }
-
-            async function startLocalStream() {
-                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                document.getElementById('localVideo').srcObject = localStream;
-                muteBtn.disabled = false;
-                videoBtn.disabled = false;
-                shareBtn.disabled = false;
-            }
-
-            function createPeerConnection() {
-                pc = new RTCPeerConnection({ iceServers });
-
-                // add local tracks
-                for (const track of localStream.getTracks()) {
-                    pc.addTrack(track, localStream);
-                }
-
-                // remote track
-                pc.addEventListener('track', (ev) => {
-                    const [stream] = ev.streams;
-                    document.getElementById('remoteVideo').srcObject = stream;
-                });
-
-                // ICE
-                pc.addEventListener('icecandidate', (event) => {
-                    if (event.candidate) {
-                        ws.send(JSON.stringify({
-                            type: 'candidate',
-                            candidate: event.candidate,
-                            from: clientId,
-                            to: peers[0] || null
-                        }));
-                    }
-                });
-
-                return pc;
-            }
-
-            joinBtn.onclick = async () => {
-                const roomId = roomInput.value.trim();
-                if (!roomId) { alert('Enter room id'); return; }
-
-                await startLocalStream();
-                log('Local camera started');
-
-                const loc = window.location;
-                const wsProto = (loc.protocol === 'https:') ? 'wss' : 'ws';
-                ws = new WebSocket(`${wsProto}://${loc.host}/ws/${encodeURIComponent(roomId)}`);
-                ws.onopen = () => log('Connected to signaling server');
-                ws.onclose = () => log('Signaling connection closed');
-                ws.onerror = (e) => console.error('ws error', e);
-
-                ws.onmessage = async (evt) => {
-                    const msg = JSON.parse(evt.data);
-                    console.log('WS message', msg);
-
-                    switch (msg.type) {
-                        case 'joined':
-                            clientId = msg.client_id;
-                            peers = msg.peers || [];
-                            log(`Joined as ${clientId}. Peers: ${peers.join(',')}`);
-                            callBtn.disabled = false;
-                            sendBtn.disabled = false;
-                            break;
-
-                        case 'peer_joined':
-                            peers.push(msg.client_id);
-                            log(`Peer ${msg.client_id} joined`);
-                            callBtn.disabled = false;
-                            break;
-
-                        case 'offer':
-                            if (!pc) createPeerConnection();
-                            await pc.setRemoteDescription(new RTCSessionDescription(msg.offer));
-                            const answer = await pc.createAnswer();
-                            await pc.setLocalDescription(answer);
-                            ws.send(JSON.stringify({
-                                type: 'answer',
-                                answer: pc.localDescription,
-                                from: clientId,
-                                to: msg.from
-                            }));
-                            callBtn.disabled = true;
-                            hangupBtn.disabled = false;
-                            break;
-
-                        case 'answer':
-                            if (pc) {
-                                await pc.setRemoteDescription(new RTCSessionDescription(msg.answer));
-                                log('Call established');
-                            }
-                            break;
-
-                        case 'candidate':
-                            if (pc && msg.candidate) {
-                                try { await pc.addIceCandidate(msg.candidate); }
-                                catch (err) { console.warn('addIceCandidate error', err); }
-                            }
-                            break;
-
-                        case 'chat':
-                            addChatMessage(msg.text, msg.from);
-                            break;
-
-                        case 'peer_left':
-                            log(`Peer ${msg.client_id} left`);
-                            peers = peers.filter(p => p !== msg.client_id);
-                            break;
-
-                        case 'room_full':
-                            alert('Room full');
-                            break;
-                    }
-                };
-            };
-
-            callBtn.onclick = async () => {
-                if (!pc) createPeerConnection();
-                const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-                ws.send(JSON.stringify({
-                    type: 'offer',
-                    offer: pc.localDescription,
-                    from: clientId,
-                    to: peers[0] || null
-                }));
-                log('Offer sent');
-                callBtn.disabled = true;
-                hangupBtn.disabled = false;
-            };
-
-            hangupBtn.onclick = () => {
-                if (pc) { pc.close(); pc = null; }
-                if (localStream) {
-                    localStream.getTracks().forEach(t => t.stop());
-                    localStream = null;
-                    document.getElementById('localVideo').srcObject = null;
-                }
-                document.getElementById('remoteVideo').srcObject = null;
-                hangupBtn.disabled = true;
-                callBtn.disabled = false;
-                log('Call ended');
-            };
-
-            muteBtn.onclick = () => {
-                if (!localStream) return;
-                muted = !muted;
-                localStream.getAudioTracks().forEach(track => track.enabled = !muted);
-                muteBtn.textContent = muted ? "Unmute" : "Mute";
-            };
-
-            videoBtn.onclick = () => {
-                if (!localStream) return;
-                videoOff = !videoOff;
-                localStream.getVideoTracks().forEach(track => track.enabled = !videoOff);
-                videoBtn.textContent = videoOff ? "Start Video" : "Stop Video";
-            };
-
-            shareBtn.onclick = async () => {
-                if (!pc) return;
-
-                if (!screenStream) {
-                    try {
-                        screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
-                        const screenTrack = screenStream.getVideoTracks()[0];
-                        pc.addTrack(screenTrack, screenStream);
-                        localScreen.srcObject = screenStream;
-                        localScreen.hidden = false;
-                        shareBtn.textContent = "Stop Sharing";
-
-                        log("Started screen share");
-
-                        // Handle when user stops sharing via browser UI
-                        screenTrack.onended = () => {
-                            stopScreenShare();
-                        };
-
-                    } catch (err) {
-                        console.error("Error sharing screen:", err);
-                    }
-                } else {
-                    stopScreenShare();
-                }
-            };
-
-            function stopScreenShare() {
-                if (screenStream) {
-                    screenStream.getTracks().forEach(t => t.stop());
-                    screenStream = null;
-                    localScreen.hidden = true;
-                    shareBtn.textContent = "Share Screen";
-                    log("Stopped screen sharing");
-                }
-            }
-
-            pc.ontrack = event => {
-                const track = event.track;
-                const stream = event.streams[0];
-
-                if (track.kind === "video") {
-                    // Decide if it's a camera or screen stream
-                    if (stream.getVideoTracks().length > 1) {
-                        // Optional: handle multi-track logic
-                    }
-
-                    if (!remoteVideo.srcObject) {
-                        remoteVideo.srcObject = stream;
-                    } else if (!remoteScreen.srcObject && stream.id !== remoteVideo.srcObject.id) {
-                        remoteScreen.srcObject = stream;
-                        remoteScreen.hidden = false;
-                    }
-                }
-
-                if (track.kind === "audio") {
-                    if (!remoteVideo.srcObject) remoteVideo.srcObject = stream;
-                }
-            };
-
-            // client-side recording + upload
-            let mediaRecorder = null;
-            let recordingMeetingId = null;
-            const BASE_URL = "http://localhost:8000";
-
-            async function startRecording(meetingId) {
-                // This uses the same localStream we already create
-                if (!localStream) {
-                    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-                    document.getElementById('localVideo').srcObject = localStream;
-                }
-
-                // We want audio only for ASR; create a stream with audio track(s)
-                const audioTracks = localStream.getAudioTracks();
-                const audioOnly = new MediaStream();
-                audioTracks.forEach(t => audioOnly.addTrack(t));
-
-                // Create MediaRecorder (use 'audio/webm' for demo; adjust for browser support)
-                mediaRecorder = new MediaRecorder(audioOnly, { mimeType: 'audio/webm' });
-
-                const CHUNK_UPLOAD_URL = `${BASE_URL}/ai/upload_chunk/`;
-
-                mediaRecorder.ondataavailable = async (evt) => {
-                    if (evt.data && evt.data.size > 0) {
-                        // form-data upload
-                        const form = new FormData();
-                        form.append("meeting_id", meetingId);
-                        // blob name can be timestamped
-                        form.append("chunk", new File([evt.data], `chunk_${Date.now()}.webm`));
-                        try {
-                            await fetch(CHUNK_UPLOAD_URL, { method: "POST", body: form });
-                        } catch (err) {
-                            console.error("upload chunk error", err);
-                        }
-                    }
-                };
-
-                mediaRecorder.onstop = () => {
-                    console.log("recorder stopped");
-                };
-
-                mediaRecorder.start(30000); // emit blob every 30s (adjust)
-                recordingMeetingId = meetingId;
-            }
-
-            function stopRecording() {
-                if (mediaRecorder && mediaRecorder.state !== "inactive") {
-                    mediaRecorder.stop();
-                }
-                mediaRecorder = null;
-                recordingMeetingId = null;
-            }
-
-            async function sendChat(text) {
-    const ts = Date.now() / 1000;
-    const roomId = roomInput.value.trim();
-    const msg = { meeting_id: roomId, sender: clientId, text, ts };
-
-    try {
-        // WebSocket chat
-        ws.send(JSON.stringify({ type: 'chat', text, from: clientId }));
-
-        // Optional backend logging
-        await fetch(`${BASE_URL}/ai/log_chat/`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(msg)
-        });
-    } catch (e) {
-        console.error("Chat send failed", e);
-    }
-}
-
-sendBtn.onclick = () => {
-    const text = chatInput.value.trim();
-    if (!text) return;
-    sendChat(text);
-    addChatMessage(text, "me");
-    chatInput.value = "";
-};
-
-        })();
-    </script>
-</body>
-
-</html> -->
-
-
-<!DOCTYPE html>
+<!-- <!DOCTYPE html>
 <html lang="en">
 
 <head>
@@ -731,6 +299,453 @@ sendBtn.onclick = () => {
         summaryBox.textContent = "❌ Error finalizing meeting.";
         console.error(err);
       }
+    };
+  </script>
+</body>
+
+</html> -->
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>SummitAI — Minimal AI assisted meets platform</title>
+  <style>
+    :root {
+      --primary: #1a73e8;
+      --primary-dark: #155ab6;
+      --danger: #e84545;
+      --bg: #f7f9fc;
+      --card-bg: #ffffff;
+      --text: #202124;
+      --border: #dadce0;
+      --radius: 10px;
+      --transition: 0.25s ease;
+    }
+
+    body {
+      font-family: "Inter", "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+    }
+
+    h2 {
+      margin-top: 1.2em;
+      color: var(--primary-dark);
+      letter-spacing: 0.5px;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+    }
+
+    #controls {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 0.5em;
+      margin: 1em 0;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1em 1.5em;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+    }
+
+    #controls input {
+      padding: 0.6em 1em;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 0.95em;
+      width: 180px;
+    }
+
+    button {
+      border: none;
+      padding: 0.6em 1.2em;
+      font-size: 0.95em;
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition: var(--transition);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    #join {
+      background: var(--primary);
+      color: #fff;
+    }
+
+    #join:hover:not(:disabled) {
+      background: var(--primary-dark);
+    }
+
+    #leave {
+      background: var(--danger);
+      color: #fff;
+    }
+
+    #leave:hover:not(:disabled) {
+      background: #c73030;
+    }
+
+    #mute,
+    #video {
+      background: #f1f3f4;
+      color: var(--text);
+    }
+
+    #mute:hover,
+    #video:hover {
+      background: #e0e3e7;
+    }
+
+    #finalize {
+      margin-top: 1em;
+      margin-bottom: 1rem;
+      background: #0f9d58;
+      color: #fff;
+    }
+
+    #finalize:hover:not(:disabled) {
+      background: #0c7a44;
+    }
+
+    #videos {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 1em;
+      width: 100%;
+      max-width: 900px;
+      margin-top: 1em;
+    }
+
+    video {
+      width: 45%;
+      max-width: 420px;
+      border-radius: var(--radius);
+      background: #000;
+      border: 2px solid var(--border);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      transition: var(--transition);
+    }
+
+    video:hover {
+      transform: scale(1.02);
+      border-color: var(--primary);
+    }
+
+    #chat {
+      width: 60%;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin-top: 1.5em;
+      padding: 1em;
+      height: 250px;
+      overflow-y: auto;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+    }
+
+    #chat div {
+      padding: 0.4em 0.6em;
+      margin-bottom: 0.4em;
+      border-radius: 6px;
+      font-size: 0.95em;
+    }
+
+    #chat div:nth-child(even) {
+      background: #f8f9fa;
+    }
+
+    #chat div:nth-child(odd) {
+      background: #eef6ff;
+    }
+
+    #chat-input {
+      width: 60%;
+      margin-top: 0.5em;
+      display: flex;
+      gap: 0.5em;
+    }
+
+    #chat-input input {
+      flex: 1;
+      padding: 0.6em 1em;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 0.95em;
+    }
+
+    #chat-input button {
+      background: var(--primary);
+      color: #fff;
+    }
+
+    #chat-input button:hover {
+      background: var(--primary-dark);
+    }
+
+    #summary {
+      width: 60%;
+      background: #e8f6ff;
+      border-radius: var(--radius);
+      padding: 1.2em;
+      margin-top: 1.5em;
+      border: 1px solid #bce0fd;
+      display: none;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+    }
+
+    #summary pre {
+      background: #fff;
+      padding: 0.8em;
+      border-radius: 6px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      border: 1px solid #dbe5f0;
+      font-family: monospace;
+      font-size: 0.9em;
+    }
+
+    #chat::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    #chat::-webkit-scrollbar-thumb {
+      background: #c3c8ce;
+      border-radius: 8px;
+    }
+
+    #chat::-webkit-scrollbar-thumb:hover {
+      background: #a8adb3;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>SummitAI</h2>
+
+  <div id="controls">
+    <input id="room" placeholder="Room ID" />
+    <button id="join">Join Room</button>
+    <button id="leave" disabled>Leave</button>
+
+    <button id="mute" disabled>Mute</button>
+    <button id="video" disabled>Turn Off Video</button>
+  </div>
+
+  <div id="videos">
+    <video id="localVideo" autoplay muted playsinline></video>
+    <video id="remoteVideo" autoplay playsinline></video>
+  </div>
+
+  <div id="chat"></div>
+
+  <div id="chat-input">
+    <input id="chatText" placeholder="Type a message..." />
+    <button id="send">Send</button>
+  </div>
+
+  <button id="finalize" disabled>End Meeting & Summarize</button>
+
+  <div id="summary"></div>
+
+  <script>
+    const BASE_URL = location.origin;
+    const roomInput = document.getElementById("room");
+    const joinBtn = document.getElementById("join");
+    const leaveBtn = document.getElementById("leave");
+    const finalizeBtn = document.getElementById("finalize");
+    const sendBtn = document.getElementById("send");
+    const chatInput = document.getElementById("chatText");
+    const chatBox = document.getElementById("chat");
+    const summaryBox = document.getElementById("summary");
+    const localVideo = document.getElementById("localVideo");
+    const remoteVideo = document.getElementById("remoteVideo");
+    const muteBtn = document.getElementById("mute");
+    const videoBtn = document.getElementById("video");
+
+    let ws, pc, clientId;
+    let localStream;
+    let currentRoomId = null;
+    let isMuted = false;
+    let isVideoOff = false;
+
+    function addChatMessage(text, who = "peer") {
+      const msg = document.createElement("div");
+      msg.textContent = (who === "me" ? "You: " : "Peer: ") + text;
+      msg.style.marginBottom = "4px";
+      chatBox.appendChild(msg);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    async function createPeerConnection() {
+      pc = new RTCPeerConnection();
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          ws.send(JSON.stringify({ type: "ice", candidate: e.candidate, from: clientId }));
+        }
+      };
+      pc.ontrack = (e) => {
+        remoteVideo.srcObject = e.streams[0];
+      };
+      localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+    }
+
+    joinBtn.onclick = async () => {
+      const roomId = roomInput.value.trim();
+      if (!roomId) return alert("Enter room ID");
+      currentRoomId = roomId;
+      joinBtn.disabled = true;
+      leaveBtn.disabled = false;
+      finalizeBtn.disabled = false;
+      muteBtn.disabled = false;
+      videoBtn.disabled = false;
+
+      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localVideo.srcObject = localStream;
+
+      startRecording(roomId);
+
+      ws = new WebSocket(`ws://${location.host}/ws/${roomId}`);
+
+      ws.onmessage = async (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === "joined") {
+          clientId = data.client_id;
+          await createPeerConnection();
+
+          if (data.peers.length > 0) {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({ type: "offer", offer, from: clientId }));
+          }
+        } else if (data.type === "offer") {
+          await createPeerConnection();
+          await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          ws.send(JSON.stringify({ type: "answer", answer, from: clientId }));
+        } else if (data.type === "answer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+        } else if (data.type === "ice") {
+          if (data.candidate) await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        } else if (data.type === "chat") {
+          addChatMessage(data.text, "peer");
+        }
+      };
+    };
+
+    let mediaRecorder;
+
+    async function startRecording(roomId) {
+      try {
+        const audioStream = new MediaStream(localStream.getAudioTracks());
+        let mimeType = "";
+        if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mimeType = "audio/webm;codecs=opus";
+        else if (MediaRecorder.isTypeSupported("audio/webm")) mimeType = "audio/webm";
+        else if (MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")) mimeType = "audio/ogg;codecs=opus";
+
+        mediaRecorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : {});
+        mediaRecorder.ondataavailable = async (e) => {
+          if (e.data.size > 0) await uploadChunk(e.data, roomId);
+        };
+        mediaRecorder.start(15000);
+        console.log("🎙️ Recording started");
+      } catch (err) {
+        console.error("❌ Failed to start MediaRecorder:", err);
+      }
+    }
+
+    function stopRecording() {
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+      }
+    }
+
+    async function uploadChunk(blob, meetingId) {
+      const form = new FormData();
+      form.append("meeting_id", meetingId);
+      form.append("chunk", blob, `chunk_${Date.now()}.webm`);
+      try {
+        const resp = await fetch(`${BASE_URL}/ai/upload_chunk/`, { method: "POST", body: form });
+        const data = await resp.json();
+        console.log("Uploaded chunk:", data);
+      } catch (e) {
+        console.error("Upload failed:", e);
+      }
+    }
+
+    leaveBtn.onclick = () => {
+      if (ws) ws.close();
+      if (pc) pc.close();
+      stopRecording();
+      localStream.getTracks().forEach((t) => t.stop());
+      joinBtn.disabled = false;
+      leaveBtn.disabled = true;
+      muteBtn.disabled = true;
+      videoBtn.disabled = true;
+    };
+
+    async function sendChat(text) {
+      const ts = Date.now() / 1000;
+      const msg = { meeting_id: currentRoomId, sender: clientId, text, ts };
+      try {
+        ws.send(JSON.stringify({ type: "chat", text, from: clientId }));
+        await fetch(`${BASE_URL}/ai/log_chat/`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(msg),
+        });
+      } catch (e) {
+        console.error("Chat send failed:", e);
+      }
+    }
+
+    sendBtn.onclick = () => {
+      const text = chatInput.value.trim();
+      if (!text) return;
+      sendChat(text);
+      addChatMessage(text, "me");
+      chatInput.value = "";
+    };
+
+    finalizeBtn.onclick = async () => {
+      finalizeBtn.disabled = true;
+      summaryBox.style.display = "block";
+      summaryBox.textContent = "⏳ Generating AI summary...";
+      try {
+        const resp = await fetch(`${BASE_URL}/ai/finalize/?meeting_id=${currentRoomId}`, { method: "POST" });
+        const data = await resp.json();
+        if (data.summary) {
+          summaryBox.innerHTML = `<h3>Meeting Summary</h3><pre>${data.summary}</pre>`;
+        } else {
+          summaryBox.textContent = "⚠️ Could not generate summary.";
+        }
+      } catch (err) {
+        summaryBox.textContent = "❌ Error finalizing meeting.";
+        console.error(err);
+      }
+    };
+
+    muteBtn.onclick = () => {
+      isMuted = !isMuted;
+      localStream.getAudioTracks().forEach((track) => (track.enabled = !isMuted));
+      muteBtn.textContent = isMuted ? "Unmute" : "Mute";
+    };
+
+    videoBtn.onclick = () => {
+      isVideoOff = !isVideoOff;
+      localStream.getVideoTracks().forEach((track) => (track.enabled = !isVideoOff));
+      videoBtn.textContent = isVideoOff ? "Turn On Video" : "Turn Off Video";
     };
   </script>
 </body>
