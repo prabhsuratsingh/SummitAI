@@ -278,6 +278,13 @@
 
     const socket = io();
 
+
+    socket.on("connect", () => {
+      clientId = socket.id;
+      console.log("Connected with clientId:", clientId);
+    });
+
+
     joinBtn.onclick = async () => {
       const room = roomInput.value.trim();
       if (!room) return alert("Enter room ID");
@@ -292,6 +299,7 @@
 
       localVideo.srcObject = localStream;
       socket.emit("join", { room });
+      startRecording(room);
     };
 
 
@@ -402,18 +410,37 @@
       }
     }
 
+    // async function uploadChunk(blob, meetingId) {
+    //   const form = new FormData();
+    //   form.append("meeting_id", meetingId);
+    //   form.append("chunk", blob, `chunk_${Date.now()}.webm`);
+    //   try {
+    //     const resp = await fetch(`${BASE_URL}/ai/upload_chunk/`, { method: "POST", body: form });
+    //     const data = await resp.json();
+    //     console.log("Uploaded chunk:", data);
+    //   } catch (e) {
+    //     console.error("Upload failed:", e);
+    //   }
+    // }
+
     async function uploadChunk(blob, meetingId) {
       const form = new FormData();
       form.append("meeting_id", meetingId);
       form.append("chunk", blob, `chunk_${Date.now()}.webm`);
       try {
         const resp = await fetch(`${BASE_URL}/ai/upload_chunk/`, { method: "POST", body: form });
+        if (!resp.ok) {
+          const text = await resp.text();
+          console.error("❌ Upload failed:", resp.status, text);
+          return;
+        }
         const data = await resp.json();
-        console.log("Uploaded chunk:", data);
+        console.log("✅ Uploaded chunk:", data);
       } catch (e) {
-        console.error("Upload failed:", e);
+        console.error("⚠️ Upload error:", e);
       }
     }
+
 
     leaveBtn.onclick = () => {
       if (ws) ws.close();
