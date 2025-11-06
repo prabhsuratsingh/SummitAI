@@ -10,3 +10,5 @@ wheels/
 .venv
 .env
 meetings_data/
+
+test.py
