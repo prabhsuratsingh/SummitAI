@@ -268,7 +268,6 @@
     const videoBtn = document.getElementById("video");
 
     const peers = {}; // { peerId: RTCPeerConnection }
-    const localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
 
 
     let ws, pc, clientId;
@@ -288,6 +287,13 @@
     joinBtn.onclick = async () => {
       const room = roomInput.value.trim();
       if (!room) return alert("Enter room ID");
+      navigator.mediaDevices.enumerateDevices().then(devices => {
+        console.log(devices.filter(d => d.kind === "audioinput"));
+      });
+
+
+      const localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: { deviceId: "default" } });
+      window.localStream = localStream;
 
       currentRoomId = room;
 
@@ -353,7 +359,6 @@
     }
 
     function addRemoteVideo(peerId, stream) {
-      // if (peerId === myPeerId) return;
       let video = document.getElementById(`video-${peerId}`);
       if (!video) {
         video = document.createElement("video");
@@ -385,43 +390,59 @@
 
     let mediaRecorder;
 
+
     async function startRecording(roomId) {
       try {
-        const audioStream = new MediaStream(localStream.getAudioTracks());
-        let mimeType = "";
-        if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mimeType = "audio/webm;codecs=opus";
-        else if (MediaRecorder.isTypeSupported("audio/webm")) mimeType = "audio/webm";
-        else if (MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")) mimeType = "audio/ogg;codecs=opus";
+        // use the original localStream directly (which includes both video & audio)
+        const audioTracks = localStream.getAudioTracks();
+        if (!audioTracks.length) {
+          console.warn("⚠️ No audio track found!");
+          return;
+        }
 
-        mediaRecorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : {});
+        const audioStream = new MediaStream(audioTracks);
+
+        let options = {};
+        if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
+          options = { mimeType: "audio/webm;codecs=opus" };
+        } else if (MediaRecorder.isTypeSupported("audio/webm")) {
+          options = { mimeType: "audio/webm" };
+        } else if (MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")) {
+          options = { mimeType: "audio/ogg;codecs=opus" };
+        }
+
+        console.log("🎙️ Starting recorder with options:", options);
+
+        mediaRecorder = new MediaRecorder(audioStream, options);
+
         mediaRecorder.ondataavailable = async (e) => {
-          if (e.data.size > 0) await uploadChunk(e.data, roomId);
+          if (e.data && e.data.size > 5000) {
+            console.log("📦 Audio chunk ready:", e.data.size, "bytes");
+            await uploadChunk(e.data, roomId);
+          }
         };
-        mediaRecorder.start(15000);
-        console.log("🎙️ Recording started");
+
+        mediaRecorder.onerror = (err) => console.error("Recorder error:", err);
+        mediaRecorder.onstart = () => console.log("🎧 MediaRecorder started");
+        mediaRecorder.onstop = () => console.log("🛑 MediaRecorder stopped");
+
+        mediaRecorder.start(5000); // send chunks every 5s
+
       } catch (err) {
         console.error("❌ Failed to start MediaRecorder:", err);
       }
     }
 
-    function stopRecording() {
-      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    async function stopRecording() {
+      if (!mediaRecorder) return;
+      console.log("🛑 Stopping recorder...");
+
+      if (mediaRecorder.state === "recording") {
+        mediaRecorder.requestData(); // force flush last chunk
+        await new Promise(r => setTimeout(r, 1000)); // wait 1s for blob event
         mediaRecorder.stop();
       }
     }
-
-    // async function uploadChunk(blob, meetingId) {
-    //   const form = new FormData();
-    //   form.append("meeting_id", meetingId);
-    //   form.append("chunk", blob, `chunk_${Date.now()}.webm`);
-    //   try {
-    //     const resp = await fetch(`${BASE_URL}/ai/upload_chunk/`, { method: "POST", body: form });
-    //     const data = await resp.json();
-    //     console.log("Uploaded chunk:", data);
-    //   } catch (e) {
-    //     console.error("Upload failed:", e);
-    //   }
-    // }
 
     async function uploadChunk(blob, meetingId) {
       const form = new FormData();

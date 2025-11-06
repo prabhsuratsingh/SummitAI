@@ -1,39 +1,42 @@
+from asyncore import loop
 import json
 import uuid
 from dotenv import load_dotenv
-from elevenlabs import ElevenLabs
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
 from fastapi.staticfiles import StaticFiles
 from typing import Dict, List, Optional
 import os
-import uuid
 from pathlib import Path
 from pydantic import BaseModel
 import aiofiles
 from io import BytesIO
-from elevenlabs.client import ElevenLabs
 from google import genai
 import socketio
+import asyncio
+import subprocess
+import whisper
+import tempfile
+import subprocess
 
-load_dotenv()   
+load_dotenv()
 
-ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
-elevenlabs = ElevenLabs(
-    api_key=ELEVEN_API_KEY,
-)
+
+print("Loading Whisper model...")
+whisper_model = whisper.load_model("small")
 
 app = FastAPI()
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
-
 socket_app = socketio.ASGIApp(sio)
 
 app.mount("/socket.io", socket_app)
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
-# rooms: Dict[str, Dict[str, WebSocket]] = {}
+
 rooms = {}
+
+# ---------------- SOCKET.IO EVENTS ---------------- #
 
 @sio.event
 async def connect(sid, environ):
@@ -52,13 +55,11 @@ async def join(sid, data):
 
 @sio.event
 async def signal(sid, data):
-    """Forward SDP or ICE messages."""
     target = data["target"]
     await sio.emit("signal", {"from": sid, "data": data["data"]}, to=target)
 
 @sio.event
 async def chat(sid, data):
-    """Forward chat message to everyone in the room."""
     room = data["room"]
     msg = data["message"]
     for peer in rooms.get(room, []):
@@ -74,6 +75,18 @@ async def disconnect(sid):
             break
     print(f"Client disconnected: {sid}")
 
+
+
+def has_header(path: str) -> bool:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_format", path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    return result.returncode == 0
+
+# ---------------- WEBSOCKET HANDLER ---------------- #
+
 @app.websocket("/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
     await websocket.accept()
@@ -84,7 +97,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
 
     room = rooms[room_id]
 
-    # Reject if room full (2 clients max)
     if len(room) >= 2:
         await websocket.send_text(json.dumps({"type": "room_full"}))
         await websocket.close()
@@ -147,13 +159,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
             del rooms[room_id]
 
 
-# tempstore
+# ---------------- STORAGE & MEETING LOGIC ---------------- #
+
 STORAGE_DIR = Path("./meetings_data")
 STORAGE_DIR.mkdir(exist_ok=True)
-
-# Simple in-memory meeting index (use DB for production)
-meetings = {}  # meeting_id -> { "chunks": [paths], "chats":[{...}], "participants":[], ... }
-
+meetings = {}  # structure- meeting_id -> { "chunks": [paths], "chats": [...] }
 
 class ChatMessage(BaseModel):
     meeting_id: str
@@ -161,33 +171,39 @@ class ChatMessage(BaseModel):
     text: str
     ts: float
 
+
 @app.post("/ai/upload_chunk/")
 async def upload_chunk(meeting_id: str = Form(...), chunk: UploadFile = File(...)):
     meeting_dir = STORAGE_DIR / meeting_id
     meeting_dir.mkdir(parents=True, exist_ok=True)
     chunk_id = str(uuid.uuid4()) + "_" + chunk.filename
     dest = meeting_dir / chunk_id
+
     async with aiofiles.open(dest, "wb") as f:
-        content = await chunk.read()
-        await f.write(content)
+        await f.write(await chunk.read())
 
     meetings.setdefault(meeting_id, {}).setdefault("chunks", []).append(str(dest))
     return {"status": "ok", "path": str(dest)}
+
 
 @app.post("/ai/log_chat/")
 async def log_chat(msg: ChatMessage):
     meetings.setdefault(msg.meeting_id, {}).setdefault("chats", []).append(msg.dict())
     return {"status": "ok"}
 
+
+def trim_silence(input_wav, output_wav):
+    # removes initial silence which breaks whisper
+    subprocess.run([
+        "ffmpeg","-y",
+        "-i", str(input_wav),
+        "-af", "silenceremove=start_periods=1:start_duration=0.3:start_threshold=-50dB",
+        str(output_wav)
+    ])
+
+
 @app.post("/ai/finalize/")
 async def finalize_meeting(meeting_id: str, title: Optional[str] = None):
-    """
-    Called at meeting end. This will:
-    - concatenate uploaded audio chunks into one file
-    - call transcription (OpenAI)
-    - call LLM summarization on transcript + chat log
-    - return summary
-    """
     if meeting_id not in meetings:
         raise HTTPException(status_code=404, detail="meeting not found")
 
@@ -198,19 +214,77 @@ async def finalize_meeting(meeting_id: str, title: Optional[str] = None):
     if not chunks:
         raise HTTPException(status_code=400, detail="no audio chunks uploaded")
 
+    def ts(p):
+        name = Path(p).name
+        return int(name.split("_chunk_")[1].split(".")[0])
+
+    chunks = sorted(chunks, key=ts)
+    
+    header = None
+    bodies = []
+
+    for p in chunks:
+        if header is None and has_header(p):
+            header = p
+        else:
+            bodies.append(p)
+
+    if header is None:
+        raise HTTPException(500, "no valid header webm chunk found")
+
+
     meeting_dir = STORAGE_DIR / meeting_id
-    concatenated = meeting_dir / f"{meeting_id}_full.webm"  # assuming webm audio chunks
-    # naive concatenation: for webm/ogg we should re-mux; for simplicity, we'll just join bytes for demo
-    # PRODUCTION: use ffmpeg to concatenate properly
-    with open(concatenated, "wb") as outfile:
+    concatenated = meeting_dir / f"{meeting_id}_full.webm"
+
+    # ---- Proper concatenation using ffmpeg ----
+    concat_list = meeting_dir / "concat_list.txt"
+    with open(concat_list, "w") as f:
         for p in chunks:
-            with open(p, "rb") as infile:
-                outfile.write(infile.read())
+            f.write(f"file '{Path(p).resolve()}'\n")
+    
+    joined_path = meeting_dir / f"{meeting_id}_joined.webm"
 
-    transcript_text = await transcribe_with_elevenlabs(concatenated)
+    with open(joined_path, "wb") as out:
+        # write header chunk (full EBML)
+        with open(header, "rb") as f:
+            out.write(f.read())
 
+        # append cluster bodies
+        for p in bodies:
+            with open(p, "rb") as f:
+                out.write(f.read())
+
+
+    concat_cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_list),
+        "-c", "copy",
+        str(concatenated)
+    ]
+    subprocess.run(concat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # ---- Convert concatenated WebM → WAV (mono 16 kHz) ----
+    wav_path = meeting_dir / f"{meeting_id}_final.wav"
+    convert_cmd = [
+        "ffmpeg", "-y",
+        "-i", str(joined_path),
+        "-ac", "1",          # mono
+        "-ar", "16000",      # 16 kHz sample rate
+        "-f", "wav",
+        str(wav_path)
+    ]
+    subprocess.run(convert_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # ---- Transcribe WAV with Whisper ----
+    trimmed = meeting_dir / f"{meeting_id}_trimmed.wav"
+    trim_silence(wav_path, trimmed)
+    print(">>> using wav:", trimmed, os.path.getsize(trimmed))
+    transcript_text = await transcribe_with_whisper(trimmed)
+
+    # ---- Summarize ----
     prompt = build_summary_prompt(title or f"Meeting {meeting_id}", transcript_text, chats)
-
     summary = await summarize_with_gemini(prompt)
 
     meetings[meeting_id]["transcript"] = transcript_text
@@ -218,34 +292,35 @@ async def finalize_meeting(meeting_id: str, title: Optional[str] = None):
 
     return {"status": "ok", "summary": summary, "transcript": transcript_text}
 
-async def transcribe_with_elevenlabs(audio_path: Path) -> str:
-    """
-    Use ElevenLabs Speech-to-Text for transcription.
-    """
 
-    with open(audio_path, "rb") as f:
-        audio_data = BytesIO(f.read())
-        transcription = elevenlabs.speech_to_text.convert(
-            file=audio_data,
-            model_id="scribe_v1", 
-            tag_audio_events=True, 
-            language_code="eng",
-            diarize=True,
-        )
+# ---------------- AI HELPERS ---------------- #
 
-    return transcription
+async def transcribe_with_whisper(audio_path: Path) -> str:
+    """
+    Transcribe audio using OpenAI Whisper (local).
+    Supports .webm, .wav, .mp3, etc.
+    """
+    print(f"Transcribing {audio_path}...")
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, lambda: whisper_model.transcribe(str(audio_path)))
+
+    return result["text"].strip()
+
 
 async def summarize_with_gemini(prompt: str) -> str:
     """
     Summarize using Google Gemini.
     """
-    response = ai_client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+    response = ai_client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=prompt
+    )
     return response.candidates[0].content.parts[0].text.strip()
 
 
 def build_summary_prompt(title: str, transcript: str, chats: List[dict]) -> str:
     chat_text = "\n".join([f"[{c['ts']}] {c['sender']}: {c['text']}" for c in chats])
-    prompt = f"""
+    return f"""
 Meeting Title: {title}
 
 Transcript:
@@ -264,10 +339,8 @@ Please produce:
 Return the response in clear sections labeled exactly as:
 SUMMARY, DECISIONS, ACTION ITEMS, TIMESTAMPS, NEXT STEPS.
 """
-    return prompt
-
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="localhost", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
