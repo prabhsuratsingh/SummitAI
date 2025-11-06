@@ -268,7 +268,6 @@
     const videoBtn = document.getElementById("video");
 
     const peers = {}; // { peerId: RTCPeerConnection }
-    // const localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
 
 
     let ws, pc, clientId;
@@ -360,7 +359,6 @@
     }
 
     function addRemoteVideo(peerId, stream) {
-      // if (peerId === myPeerId) return;
       let video = document.getElementById(`video-${peerId}`);
       if (!video) {
         video = document.createElement("video");
@@ -392,24 +390,6 @@
 
     let mediaRecorder;
 
-    // async function startRecording(roomId) {
-    //   try {
-    //     const audioStream = new MediaStream(localStream.getAudioTracks());
-    //     let mimeType = "";
-    //     if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) mimeType = "audio/webm;codecs=opus";
-    //     else if (MediaRecorder.isTypeSupported("audio/webm")) mimeType = "audio/webm";
-    //     else if (MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")) mimeType = "audio/ogg;codecs=opus";
-
-    //     mediaRecorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : {});
-    //     mediaRecorder.ondataavailable = async (e) => {
-    //       if (e.data.size > 0) await uploadChunk(e.data, roomId);
-    //     };
-    //     mediaRecorder.start(15000);
-    //     console.log("🎙️ Recording started");
-    //   } catch (err) {
-    //     console.error("❌ Failed to start MediaRecorder:", err);
-    //   }
-    // }
 
     async function startRecording(roomId) {
       try {
@@ -447,31 +427,11 @@
         mediaRecorder.onstop = () => console.log("🛑 MediaRecorder stopped");
 
         mediaRecorder.start(5000); // send chunks every 5s
-        // mediaRecorder.start();
-
-        // let flushTimer;
-        // function scheduleFlush() {
-        //   flushTimer = setTimeout(() => {
-        //     if (mediaRecorder && mediaRecorder.state === "recording") {
-        //       console.log("🔄 Requesting data flush...");
-        //       mediaRecorder.requestData();
-        //       scheduleFlush();
-        //     }
-        //   }, 10000); // every 10s instead of 5s
-        // }
-        // scheduleFlush();
 
       } catch (err) {
         console.error("❌ Failed to start MediaRecorder:", err);
       }
     }
-
-
-    // function stopRecording() {
-    //   if (mediaRecorder && mediaRecorder.state !== "inactive") {
-    //     mediaRecorder.stop();
-    //   }
-    // }
 
     async function stopRecording() {
       if (!mediaRecorder) return;
@@ -483,20 +443,6 @@
         mediaRecorder.stop();
       }
     }
-
-
-    // async function uploadChunk(blob, meetingId) {
-    //   const form = new FormData();
-    //   form.append("meeting_id", meetingId);
-    //   form.append("chunk", blob, `chunk_${Date.now()}.webm`);
-    //   try {
-    //     const resp = await fetch(`${BASE_URL}/ai/upload_chunk/`, { method: "POST", body: form });
-    //     const data = await resp.json();
-    //     console.log("Uploaded chunk:", data);
-    //   } catch (e) {
-    //     console.error("Upload failed:", e);
-    //   }
-    // }
 
     async function uploadChunk(blob, meetingId) {
       const form = new FormData();
