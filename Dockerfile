@@ -10,6 +10,8 @@ ENV FFPROBE=/usr/local/bin/ffprobe
 ENV PYTORCH_ENABLE_MPS_FALLBACK=1
 ENV CUDA_VISIBLE_DEVICES=""
 
+WORKDIR /app
+
 RUN mkdir -p /cache/uv
 ENV UV_LINK_MODE=copy
 ENV UV_CACHE_DIR=/cache/uv
@@ -18,11 +20,12 @@ ARG UID=10001
 RUN adduser \
     --disabled-password \
     --gecos "" \
-    --home "/nonexistent" \
+    --home "/home/appuser" \
     --shell "/sbin/nologin" \
-    --no-create-home \
     --uid "${UID}" \
-    appuser
+    appuser && \
+    mkdir -p /home/appuser && chown appuser:appuser /home/appuser
+
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl wget build-essential \
@@ -38,9 +41,6 @@ RUN wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.t
 ENV FFMPEG=/usr/local/bin/ffmpeg
 ENV FFPROBE=/usr/local/bin/ffprobe
 
-WORKDIR /app
-
-COPY . /app
 
 
 RUN --mount=type=cache,target=/cache/uv \
@@ -48,13 +48,16 @@ RUN --mount=type=cache,target=/cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --frozen --no-install-project
 
+COPY . /app
 
 RUN --mount=type=cache,target=/cache/uv \
     uv sync --frozen
 
-RUN chown -R appuser:appuser /cache/uv /app
+RUN chown appuser:appuser /cache/uv /app
+RUN mkdir -p /app/meetings_data && chown -R appuser:appuser /app/meetings_data
 
 USER appuser
 
 EXPOSE 8000
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+
+CMD ["uv", "run", "server.py"]
