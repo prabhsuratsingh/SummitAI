@@ -17,6 +17,7 @@ import subprocess
 import whisper
 import tempfile
 import subprocess
+import time
 
 load_dotenv()
 
@@ -201,7 +202,7 @@ def trim_silence(input_wav, output_wav):
         str(output_wav)
     ])
 
-
+# Modified for benchmarking
 @app.post("/ai/finalize/")
 async def finalize_meeting(meeting_id: str, title: Optional[str] = None):
     if meeting_id not in meetings:
@@ -219,10 +220,9 @@ async def finalize_meeting(meeting_id: str, title: Optional[str] = None):
         return int(name.split("_chunk_")[1].split(".")[0])
 
     chunks = sorted(chunks, key=ts)
-    
+
     header = None
     bodies = []
-
     for p in chunks:
         if header is None and has_header(p):
             header = p
@@ -232,7 +232,6 @@ async def finalize_meeting(meeting_id: str, title: Optional[str] = None):
     if header is None:
         raise HTTPException(500, "no valid header webm chunk found")
 
-
     meeting_dir = STORAGE_DIR / meeting_id
     concatenated = meeting_dir / f"{meeting_id}_full.webm"
 
@@ -241,24 +240,19 @@ async def finalize_meeting(meeting_id: str, title: Optional[str] = None):
     with open(concat_list, "w") as f:
         for p in chunks:
             f.write(f"file '{Path(p).resolve()}'\n")
-    
+
     joined_path = meeting_dir / f"{meeting_id}_joined.webm"
 
     with open(joined_path, "wb") as out:
-        # write header chunk (full EBML)
         with open(header, "rb") as f:
             out.write(f.read())
-
-        # append cluster bodies
         for p in bodies:
             with open(p, "rb") as f:
                 out.write(f.read())
 
-
     concat_cmd = [
         "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
+        "-f", "concat", "-safe", "0",
         "-i", str(concat_list),
         "-c", "copy",
         str(concatenated)
@@ -270,22 +264,48 @@ async def finalize_meeting(meeting_id: str, title: Optional[str] = None):
     convert_cmd = [
         "ffmpeg", "-y",
         "-i", str(joined_path),
-        "-ac", "1",          # mono
-        "-ar", "16000",      # 16 kHz sample rate
+        "-ac", "1",
+        "-ar", "16000",
         "-f", "wav",
         str(wav_path)
     ]
     subprocess.run(convert_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # ---- Transcribe WAV with Whisper ----
+    # ---- Trim silence ----
     trimmed = meeting_dir / f"{meeting_id}_trimmed.wav"
     trim_silence(wav_path, trimmed)
     print(">>> using wav:", trimmed, os.path.getsize(trimmed))
-    transcript_text = await transcribe_with_whisper(trimmed)
 
-    # ---- Summarize ----
+    # ---- Measure internal timings ----
+    timing_log = Path("./bench_results/internal_timings.csv")
+    timing_log.parent.mkdir(exist_ok=True)
+    if not timing_log.exists():
+        with open(timing_log, "w") as f:
+            f.write("meeting_id,phase,time_s\n")
+
+    # FFmpeg already done above, but we can mark the timing:
+    ffmpeg_t = 0.0  # optionally measure the concat/convert time if you wish
+
+    start_whisper = time.perf_counter()
+    transcript_text = await transcribe_with_whisper(trimmed)
+    whisper_t = time.perf_counter() - start_whisper
+
+    # ---- Build prompt BEFORE timing Gemini ----
     prompt = build_summary_prompt(title or f"Meeting {meeting_id}", transcript_text, chats)
+
+    start_gemini = time.perf_counter()
     summary = await summarize_with_gemini(prompt)
+    gemini_t = time.perf_counter() - start_gemini
+
+    total_t = whisper_t + gemini_t
+
+    print(f"[BENCH] Whisper={whisper_t:.2f}s Gemini={gemini_t:.2f}s Total={total_t:.2f}s")
+
+    # Log to CSV
+    with open(timing_log, "a") as f:
+        f.write(f"{meeting_id},whisper,{whisper_t:.3f}\n")
+        f.write(f"{meeting_id},gemini,{gemini_t:.3f}\n")
+        f.write(f"{meeting_id},total,{total_t:.3f}\n")
 
     meetings[meeting_id]["transcript"] = transcript_text
     meetings[meeting_id]["summary"] = summary

@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  meetai:
+    build: .
+    container_name: meetai_app
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - ./meetings_data:/app/meetings_data
+      - ./benchmark:/app/benchmark
+    command: uv run server.py
+
+  benchmark:
+    image: ghcr.io/astral-sh/uv:python3.11-bookworm
+    container_name: meetai_benchmark
+    depends_on:
+      - meetai
+    volumes:
+      - ./:/app
+      - ./run_benchmark.py:/app/run_benchmark.py
+      - ./sample.wav:/app/sample.wav
+      - ./benchmark:/app/benchmark
+    working_dir: /app
+    command: >
+      bash -c "
+      uv sync &&
+      uv pip install aiohttp psutil pandas matplotlib tqdm &&
+      sleep 6 &&
+      uv run /app/run_benchmark.py &&
+      chown -R 1000:1000 /app/benchmark
+      "
+
