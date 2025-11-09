@@ -1,0 +1,7 @@
+CPU: 
+Cores: 8
+RAM: 8.24 GB
+GPU: No GPU detected
+Container resource info not available
+OS: Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.36
+Python: 3.11.14
