@@ -1,4 +1,5 @@
 from asyncore import loop
+import datetime
 import json
 import uuid
 from dotenv import load_dotenv
@@ -17,8 +18,37 @@ import subprocess
 import whisper
 import tempfile
 import subprocess
+from motor.motor_asyncio import AsyncIOMotorClient
+from botocore.client import Config
+import boto3
+from botocore.auth import S3SigV4Auth
+from botocore.awsrequest import AWSRequest
+import requests
+from datetime import datetime
+
 
 load_dotenv()
+
+# ---- MongoDB setup ----
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB = os.getenv("MONGO_DB", "summitai")
+mongo_client = AsyncIOMotorClient(MONGO_URI)
+db = mongo_client[MONGO_DB]
+
+# ---- TEBI setup ----
+TEBI_ACCESS_KEY = os.getenv("TEBI_ACCESS_KEY")
+TEBI_SECRET_KEY = os.getenv("TEBI_SECRET_KEY")
+TEBI_BUCKET = os.getenv("TEBI_BUCKET")
+TEBI_ENDPOINT = os.getenv("TEBI_ENDPOINT")
+
+s3 = boto3.client(
+    "s3",
+    aws_access_key_id=TEBI_ACCESS_KEY,
+    aws_secret_access_key=TEBI_SECRET_KEY,
+    endpoint_url=TEBI_ENDPOINT,
+    config=Config(signature_version="s3v4")
+)
+
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -35,6 +65,43 @@ app.mount("/socket.io", socket_app)
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
 
 rooms = {}
+
+
+async def upload_to_tebi(file_path: Path, dest_key: str) -> str:
+    data = file_path.read_bytes()
+    content_length = len(data)
+
+    url = f"{TEBI_ENDPOINT.rstrip('/')}/{TEBI_BUCKET}/{dest_key}"
+
+    # Create a signed request manually
+    request = AWSRequest(
+        method="PUT",
+        url=url,
+        data=data,
+        headers={"Content-Length": str(content_length)}
+    )
+    S3SigV4Auth(
+        credentials=s3._request_signer._credentials,
+        service_name="s3",
+        region_name="us-east-1" 
+    ).add_auth(request)
+
+    resp = requests.put(
+        url,
+        data=data,
+        headers=dict(request.headers),
+        timeout=60
+    )
+
+    if not resp.ok:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Tebi upload failed ({resp.status_code}): {resp.text}"
+        )
+
+    return url
+
+
 
 # ---------------- SOCKET.IO EVENTS ---------------- #
 
@@ -176,19 +243,47 @@ class ChatMessage(BaseModel):
 async def upload_chunk(meeting_id: str = Form(...), chunk: UploadFile = File(...)):
     meeting_dir = STORAGE_DIR / meeting_id
     meeting_dir.mkdir(parents=True, exist_ok=True)
-    chunk_id = str(uuid.uuid4()) + "_" + chunk.filename
-    dest = meeting_dir / chunk_id
 
-    async with aiofiles.open(dest, "wb") as f:
+    chunk_id = f"{uuid.uuid4()}_{chunk.filename}"
+    local_path = meeting_dir / chunk_id
+
+    async with aiofiles.open(local_path, "wb") as f:
         await f.write(await chunk.read())
 
-    meetings.setdefault(meeting_id, {}).setdefault("chunks", []).append(str(dest))
-    return {"status": "ok", "path": str(dest)}
+    # Upload to Tebi
+    s3_key = f"meetings/{meeting_id}/chunks/{chunk_id}"
+    tebi_url = await upload_to_tebi(local_path, s3_key)
+
+    # Save meeet data in MongoDB
+    await db.chunks.insert_one({
+        "meeting_id": meeting_id,
+        "chunk_id": chunk_id,
+        "s3_url": tebi_url,
+        "created_at": datetime.utcnow()
+    })
+
+    # Link to meeting record
+    await db.meetings.update_one(
+        {"meeting_id": meeting_id},
+        {"$push": {"chunks": {"chunk_id": chunk_id, "url": tebi_url}}},
+        upsert=True
+    )
+
+    return {"status": "ok", "url": tebi_url}
 
 
 @app.post("/ai/log_chat/")
 async def log_chat(msg: ChatMessage):
-    meetings.setdefault(msg.meeting_id, {}).setdefault("chats", []).append(msg.dict())
+    chat_doc = msg.dict()
+    chat_doc["created_at"] = datetime.utcnow()
+
+    await db.chats.insert_one(chat_doc)
+    await db.meetings.update_one(
+        {"meeting_id": msg.meeting_id},
+        {"$push": {"chats": chat_doc}},
+        upsert=True
+    )
+
     return {"status": "ok"}
 
 
@@ -202,28 +297,43 @@ def trim_silence(input_wav, output_wav):
     ])
 
 
+
 @app.post("/ai/finalize/")
 async def finalize_meeting(meeting_id: str, title: Optional[str] = None):
-    if meeting_id not in meetings:
+    # ---- Fetch meeting data ----
+    meeting = await db.meetings.find_one({"meeting_id": meeting_id})
+    if not meeting:
         raise HTTPException(status_code=404, detail="meeting not found")
 
-    meeting = meetings[meeting_id]
     chunks = meeting.get("chunks", [])
     chats = meeting.get("chats", [])
 
     if not chunks:
         raise HTTPException(status_code=400, detail="no audio chunks uploaded")
 
+    meeting_dir = STORAGE_DIR / meeting_id
+    meeting_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Download chunks from Tebi ----
+    downloaded_chunks = []
+    for ch in chunks:
+        chunk_id = ch["chunk_id"]
+        local_path = meeting_dir / chunk_id
+        s3.download_file(TEBI_BUCKET, f"meetings/{meeting_id}/chunks/{chunk_id}", str(local_path))
+        downloaded_chunks.append(str(local_path))
+
     def ts(p):
         name = Path(p).name
-        return int(name.split("_chunk_")[1].split(".")[0])
+        try:
+            return int(name.split("_chunk_")[1].split(".")[0])
+        except Exception:
+            return 0
 
-    chunks = sorted(chunks, key=ts)
-    
+    downloaded_chunks = sorted(downloaded_chunks, key=ts)
+
     header = None
     bodies = []
-
-    for p in chunks:
+    for p in downloaded_chunks:
         if header is None and has_header(p):
             header = p
         else:
@@ -232,40 +342,14 @@ async def finalize_meeting(meeting_id: str, title: Optional[str] = None):
     if header is None:
         raise HTTPException(500, "no valid header webm chunk found")
 
-
-    meeting_dir = STORAGE_DIR / meeting_id
-    concatenated = meeting_dir / f"{meeting_id}_full.webm"
-
-    # ---- Proper concatenation using ffmpeg ----
-    concat_list = meeting_dir / "concat_list.txt"
-    with open(concat_list, "w") as f:
-        for p in chunks:
-            f.write(f"file '{Path(p).resolve()}'\n")
-    
     joined_path = meeting_dir / f"{meeting_id}_joined.webm"
-
     with open(joined_path, "wb") as out:
-        # write header chunk (full EBML)
         with open(header, "rb") as f:
             out.write(f.read())
-
-        # append cluster bodies
         for p in bodies:
             with open(p, "rb") as f:
                 out.write(f.read())
 
-
-    concat_cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(concat_list),
-        "-c", "copy",
-        str(concatenated)
-    ]
-    subprocess.run(concat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # ---- Convert concatenated WebM → WAV (mono 16 kHz) ----
     wav_path = meeting_dir / f"{meeting_id}_final.wav"
     convert_cmd = [
         "ffmpeg", "-y",
@@ -277,20 +361,42 @@ async def finalize_meeting(meeting_id: str, title: Optional[str] = None):
     ]
     subprocess.run(convert_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # ---- Transcribe WAV with Whisper ----
     trimmed = meeting_dir / f"{meeting_id}_trimmed.wav"
     trim_silence(wav_path, trimmed)
-    print(">>> using wav:", trimmed, os.path.getsize(trimmed))
+    print(f">>> Using trimmed WAV ({trimmed}): {os.path.getsize(trimmed)} bytes")
+
     transcript_text = await transcribe_with_whisper(trimmed)
 
-    # ---- Summarize ----
     prompt = build_summary_prompt(title or f"Meeting {meeting_id}", transcript_text, chats)
     summary = await summarize_with_gemini(prompt)
 
-    meetings[meeting_id]["transcript"] = transcript_text
-    meetings[meeting_id]["summary"] = summary
+    # ---- Upload processed audio to Tebi ----
+    final_audio_key = f"meetings/{meeting_id}/final/{meeting_id}_final.wav"
+    tebi_url = await upload_to_tebi(trimmed, final_audio_key)
 
-    return {"status": "ok", "summary": summary, "transcript": transcript_text}
+    # ---- Update MongoDB record ----
+    update_doc = {
+        "meeting_id": meeting_id,
+        "title": title or f"Meeting {meeting_id}",
+        "transcript": transcript_text,
+        "summary": summary,
+        "final_audio_url": tebi_url,
+        "updated_at": datetime.utcnow(),
+        "status": "finalized"
+    }
+    await db.meetings.update_one(
+        {"meeting_id": meeting_id},
+        {"$set": update_doc},
+        upsert=True
+    )
+
+    return {
+        "status": "ok",
+        "summary": summary,
+        "transcript": transcript_text,
+        "audio_url": tebi_url
+    }
+
 
 
 # ---------------- AI HELPERS ---------------- #
