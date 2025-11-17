@@ -4,6 +4,7 @@ import json
 import uuid
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from typing import Dict, List, Optional
 import os
@@ -58,8 +59,18 @@ print("Loading Whisper model...")
 whisper_model = whisper.load_model("small")
 
 app = FastAPI()
-sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
-socket_app = socketio.ASGIApp(sio)
+
+# Add CORS middleware - Allow all origins for development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=False,  # Must be False when allow_origins is "*"
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins=[])
+socket_app = socketio.ASGIApp(sio, socketio_path="")
 
 app.mount("/socket.io", socket_app)
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")
